@@ -1,0 +1,45 @@
+[package]
+name = "gex-strategy"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "backtest"
+path = "src/main_backtest.rs"
+
+[[bin]]
+name = "live"
+path = "src/main_live.rs"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+clap = { version = "4", features = ["derive", "env"] }
+flate2 = "1"
+reqwest = { version = "0.12", features = ["json"] }
+ibapi = "2.9"
+time = "0.3"
+serde = { version = "1", features = ["derive"] }
+signal-hook = "0.4"
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ts-rs = { version = "12", features = ["chrono-impl", "serde-json-impl"] }
+rayon = "1.11.0"
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", features = ["ring"] }
+base64 = "0.22"
+nyse-holiday-cal = "0.2.5"
+parquet = "58.1.0"
+arrow = "58.1.0"
+
+[profile.test]
+opt-level = 2
+
+[dev-dependencies]
+insta = "1.46.3"
+serial_test = "3.4.0"
