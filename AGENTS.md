@@ -4,6 +4,7 @@
 
 - **Rust backend**: all code in `src/`. No TypeScript backend.
 - **15-min bar strategy**: `BAR_INTERVAL_MINUTES = 15`. All bar indices (`BarIndex`, `IV_LOOKBACK_BARS`, `bars_since_spike`, etc.) count 15-min bars, not 1-min. Duration in seconds = bars × 15 × 60.
+- **Execution delay is in 1-min bars**: `BacktestConfig::execution_delay_bars` (default 3) counts **1-minute** bars, not 15-min. The backtest inner loop iterates `bars_1m` and calls `tick_pending_timers()` each tick. So delay = 3 minutes, **not** 3 × 15 = 45 minutes. Do not confuse with the 15-min bar indices above.
 - **USD only, long-only**: US equities only. Never generate short signals. Position sizing uses IBKR `AvailableFunds`.
 - **Optimization target**: maximize net return. MDD ≤ 10% is acceptable; don't over-optimize for Sharpe at the cost of returns.
 - **Two entry signals**: VF (VannaFlip): IV spike → compression → dealer vanna buy-back. WB (WallBounce): calm-path zone-dwell near put wall. WB is currently enabled only for JPM.
