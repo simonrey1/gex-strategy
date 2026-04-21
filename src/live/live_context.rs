@@ -12,7 +12,7 @@ use super::dashboard::{
     new_health_state, prepopulate_tickers, set_health_gex, set_health_ibkr,
     start_health_server, update_health, SharedHealthState, TickerHealth,
 };
-use super::orders::{new_fill_state, start_order_monitor, SharedFillState};
+use super::orders::{new_fill_state, SharedFillState};
 use super::setup_helpers::{fetch_initial_spots, fetch_validated_equity};
 
 use crate::data::thetadata_live::{new_live_gex, start_live_gex, SharedLiveGex};
@@ -97,13 +97,6 @@ impl LiveContext {
         let initial_equity = fetch_validated_equity(&ibkr_client).await?;
 
         let fill_state = new_fill_state();
-        {
-            let fs = fill_state.clone();
-            let client_for_monitor = ibkr_client.clone();
-            tokio::spawn(async move {
-                start_order_monitor(client_for_monitor, fs).await;
-            });
-        }
 
         Ok((
             Self { ibkr_client, order_id_gen, health_state, live_gex, fill_state, shutdown, initial_equity, spot_prices },

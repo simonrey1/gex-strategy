@@ -14,7 +14,7 @@ use super::types::{AccountSummary, BracketOrder, BracketOrderIds, Broker, Market
 
 /// Epoch-based order ID floor. Paper trading's nextValidId is unreliable
 /// after gateway restarts (returns 1 but rejects it as duplicate).
-fn epoch_order_id() -> i32 {
+pub fn epoch_order_id() -> i32 {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

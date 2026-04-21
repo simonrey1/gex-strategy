@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::collections::HashMap;
-use crate::broker::ibkr::IbkrBroker;
+use std::sync::Arc;
+use crate::broker::ibkr::{IbkrBroker, OrderIdGen};
 use crate::broker::types::Broker as _;
 use crate::config::bar_interval;
 use crate::config::{StrategyConfig, Ticker};
@@ -9,11 +10,11 @@ use crate::strategy::shared::GexPipelineBar;
 use crate::data::thetadata_live::get_live_gex_profile;
 use crate::types::{AsLenU32, F64Trunc, OhlcBar};
 
-use super::dashboard::update_health;
+use super::dashboard::{set_health_ibkr, update_health};
 use super::init::{init_ticker_states, LiveContext};
 use super::log_debug;
 use super::nyse_session::NyseSession;
-use super::orders::OrderClient;
+use super::orders::{start_order_monitor, OrderClient};
 use super::reconcile;
 use super::reconcile::{fetch_ibkr_orders, fetch_ibkr_positions};
 use super::ticker_state::LiveEntryCandidate;
@@ -26,11 +27,13 @@ pub async fn run_live(
 ) -> Result<()> {
     let port = server_cfg.port;
     let (ctx, mut broker) = LiveContext::setup(tickers, config, broker, server_cfg).await?;
-    let ibkr_client = &ctx.ibkr_client;
-    let orders = OrderClient::new(ibkr_client, ctx.order_id_gen.clone());
+
+    // Owned locals — can be swapped on reconnect (not borrowed from ctx).
+    let mut ibkr_client: Arc<ibapi::Client> = ctx.ibkr_client.clone();
+    let mut id_gen: Arc<OrderIdGen> = ctx.order_id_gen.clone();
 
     let mut states = init_ticker_states(
-        tickers, config, ibkr_client, &ctx.health_state,
+        tickers, config, &ibkr_client, &ctx.health_state,
         ctx.initial_equity, &ctx.spot_prices,
     ).await?;
 
@@ -59,16 +62,19 @@ pub async fn run_live(
         eprintln!("[live] SIGINT handler registration failed: {} — Ctrl+C may not work", e);
     }
 
-    // One-time cleanup: cancel all stale orders from previous gateway sessions.
-    // After a gateway restart, old orders are still active server-side but
-    // unmanageable via individual cancel_order (wrong client/session).
-    // global_cancel clears them so we can re-place fresh brackets.
     if let Err(e) = ibkr_client.global_cancel().await {
         eprintln!("[live] global_cancel failed: {:?} (non-fatal)", e);
     } else {
         println!("[live] global_cancel issued — clearing stale orders from previous sessions");
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
     }
+
+    // Fill monitor — tracked so we can restart it on reconnect.
+    let mut monitor_handle: tokio::task::JoinHandle<()> = {
+        let c = ibkr_client.clone();
+        let fs = ctx.fill_state.clone();
+        tokio::spawn(async move { start_order_monitor(c, fs).await; })
+    };
 
     let mut current_day = NyseSession::et_date_str(&chrono::Utc::now());
     let freshness_timeout_ms = poll_ms * 3;
@@ -90,23 +96,62 @@ pub async fn run_live(
             let instant_now = tokio::time::Instant::now();
             let since = ibkr_down_since.get_or_insert(instant_now);
             let secs = instant_now.duration_since(*since).as_secs();
-            if secs >= 60 {
+
+            if secs < 10 {
                 eprintln!(
-                    "[live] IBKR disconnected for {}s — restarting process for reconnection",
+                    "[live] IBKR disconnected ({}s) — waiting for transient recovery...",
                     secs
                 );
-                exit_reason = Some("ibkr_disconnect");
-                break;
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                continue;
             }
-            eprintln!(
-                "[live] IBKR disconnected ({}s) — waiting for auto-reconnect...",
-                secs
-            );
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+            // Gateway nightly restart takes ~1-2 min. Reconnect in-process.
+            println!("[live] IBKR disconnected for {}s — attempting in-process reconnect...", secs);
+            match broker.connect().await {
+                Ok(()) => {
+                    ibkr_client = broker.client_arc().expect("connected but no client");
+                    id_gen = broker.order_id_gen().expect("connected but no id gen");
+
+                    // Clear stale orders from the previous session
+                    if let Err(e) = ibkr_client.global_cancel().await {
+                        eprintln!("[live] post-reconnect global_cancel failed: {:?}", e);
+                    } else {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    }
+
+                    // Restart fill monitor (old task holds dead client — abort it)
+                    monitor_handle.abort();
+                    let c = ibkr_client.clone();
+                    let fs = ctx.fill_state.clone();
+                    monitor_handle = tokio::spawn(async move { start_order_monitor(c, fs).await; });
+
+                    // Update health dashboard reference
+                    set_health_ibkr(&ctx.health_state, ibkr_client.clone());
+                    {
+                        let mut hs = super::lock_or_recover(&ctx.health_state);
+                        hs.broker_connected = true;
+                    }
+
+                    ibkr_down_since = None;
+                    println!("[live] IBKR reconnected — resuming normal operation");
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[live] IBKR reconnect failed after retries: {:?} — exiting for container restart",
+                        e
+                    );
+                    exit_reason = Some("ibkr_reconnect_failed");
+                    break;
+                }
+            }
             continue;
         } else if ibkr_down_since.take().is_some() {
-            println!("[live] IBKR reconnected");
+            println!("[live] IBKR recovered (transient disconnect)");
         }
+
+        // Create OrderClient fresh each iteration so it uses the current client + id_gen.
+        let orders = OrderClient::new(&ibkr_client, id_gen.clone());
 
         // Day rollover
         let today = NyseSession::et_date_str(&now);
@@ -133,12 +178,10 @@ pub async fn run_live(
         let just_closed: std::collections::HashSet<Ticker> = std::collections::HashSet::new();
 
         // ── IBKR reconciliation ──────────────────────────────────────
-        let ibkr_positions = fetch_ibkr_positions(ibkr_client).await;
-        let ibkr_orders = fetch_ibkr_orders(ibkr_client).await;
+        let ibkr_positions = fetch_ibkr_positions(&ibkr_client).await;
+        let ibkr_orders = fetch_ibkr_orders(&ibkr_client).await;
 
         if let (Some(ref positions), Some(ref open_orders)) = (&ibkr_positions, &ibkr_orders) {
-            // Safety check: if we think we have local positions but IBKR returns empty,
-            // something may be wrong with the fetch — skip orphaned order cancellation.
             let local_position_count = states.values().filter(|ts| ts.slot_held()).count();
             let positions_fetch_suspect = local_position_count > 0 && positions.is_empty();
             if positions_fetch_suspect {
@@ -165,7 +208,6 @@ pub async fn run_live(
                 };
                 let action = local_view.reconcile(positions, open_orders);
 
-                // Cancel orphaned orders before updating state (skip if positions fetch is suspect)
                 if let super::reconcile::ReconcileAction::OrphanedOrders { ref order_ids } = action {
                     if positions_fetch_suspect {
                         eprintln!(
@@ -182,12 +224,6 @@ pub async fn run_live(
                     }
                 }
 
-                // Extra STP orders from previous wall-trail ratchets.
-                // Always force a full bracket re-place when extras exist: IBKR's
-                // cancel_order returns Ok even when the order belongs to a prior
-                // client_id (the 10147 error arrives asynchronously). The re-place
-                // path cancels ALL sell orders for this ticker, then places a clean
-                // SL+TP pair owned by the current session.
                 let has_extras = match &action {
                     super::reconcile::ReconcileAction::AdoptPosition { extra_stop_ids, .. }
                     | super::reconcile::ReconcileAction::BracketStale { extra_stop_ids, .. } => !extra_stop_ids.is_empty(),
@@ -206,7 +242,6 @@ pub async fn run_live(
 
                 if let (Some(pos), None) = (&ts.position, &ts.bracket_ids) {
                     if pos.stop_loss > 0.0 && pos.take_profit > 0.0 {
-                        // Cancel all existing SELL orders before re-placing to avoid duplicates
                         if let Some(ords) = open_orders.get(ticker.as_str()) {
                             for o in ords {
                                 if o.action == "Sell" {
@@ -227,7 +262,7 @@ pub async fn run_live(
                                     ticker, ids.stop_loss_id, ids.take_profit_id
                                 );
                                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                                let verified = match fetch_ibkr_orders(ibkr_client).await {
+                                let verified = match fetch_ibkr_orders(&ibkr_client).await {
                                     Some(ords) => {
                                         let ticker_ords = ords.get(ticker.as_str());
                                         let sl_ok = ticker_ords.map(|o| o.iter().any(|x| x.order_id == ids.stop_loss_id)).unwrap_or(false);
@@ -236,7 +271,7 @@ pub async fn run_live(
                                     }
                                     None => {
                                         eprintln!("[reconcile-{}] Could not verify bracket — order fetch failed", ticker);
-                                        true // optimistic: don't emergency-close if we can't verify
+                                        true
                                     }
                                 };
                                 if verified {
@@ -305,7 +340,7 @@ pub async fn run_live(
         for &ticker in tickers {
             let ts = states.get_mut(&ticker).expect("ticker missing from states");
             let today_bars = orders.fetch_ticker_bars(ticker, ts).await;
-            ts.check_bracket_fills(&ctx.fill_state, ibkr_client).await;
+            ts.check_bracket_fills(&ctx.fill_state, &ibkr_client).await;
             ticker_bars.insert(ticker, today_bars);
         }
 
@@ -463,7 +498,8 @@ pub async fn run_live(
     for &ticker in tickers {
         states.get(&ticker).expect("ticker missing from states").save_snapshot();
     }
-    drop(ctx.ibkr_client);
+    monitor_handle.abort();
+    drop(ibkr_client);
     let _ = broker.disconnect().await;
 
     if let Some(reason) = exit_reason {
