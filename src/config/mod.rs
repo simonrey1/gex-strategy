@@ -51,7 +51,10 @@ fn random_client_id(lo: i32, hi: i32) -> i32 {
 }
 
 pub fn ibkr_client_id_live() -> i32 {
-    random_client_id(100, 499)
+    std::env::var("IBKR_CLIENT_ID")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100)
 }
 
 pub fn ibkr_client_id_backtest() -> i32 {

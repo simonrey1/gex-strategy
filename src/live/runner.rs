@@ -211,8 +211,34 @@ pub async fn run_live(
                         let legs = pos.bracket_legs(ticker);
                         match orders.place_gtc_bracket(&legs).await {
                             Ok(ids) => {
-                                ts.bracket_ids = Some(ids);
-                                ts.save_snapshot();
+                                println!(
+                                    "[reconcile-{}] Bracket placed: SL_oid={} TP_oid={} — verifying...",
+                                    ticker, ids.stop_loss_id, ids.take_profit_id
+                                );
+                                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                                let verified = match fetch_ibkr_orders(ibkr_client).await {
+                                    Some(ords) => {
+                                        let ticker_ords = ords.get(ticker.as_str());
+                                        let sl_ok = ticker_ords.map(|o| o.iter().any(|x| x.order_id == ids.stop_loss_id)).unwrap_or(false);
+                                        let tp_ok = ticker_ords.map(|o| o.iter().any(|x| x.order_id == ids.take_profit_id)).unwrap_or(false);
+                                        sl_ok && tp_ok
+                                    }
+                                    None => {
+                                        eprintln!("[reconcile-{}] Could not verify bracket — order fetch failed", ticker);
+                                        true // optimistic: don't emergency-close if we can't verify
+                                    }
+                                };
+                                if verified {
+                                    println!("[reconcile-{}] Bracket verified OK", ticker);
+                                    ts.bracket_ids = Some(ids);
+                                    ts.save_snapshot();
+                                } else {
+                                    eprintln!(
+                                        "[reconcile-{}] Bracket NOT verified — orders rejected by IBKR. EMERGENCY CLOSE",
+                                        ticker
+                                    );
+                                    ts.force_close(&orders, "unprotected_no_bracket").await;
+                                }
                             }
                             Err(e) => {
                                 eprintln!(
