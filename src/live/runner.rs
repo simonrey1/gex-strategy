@@ -27,7 +27,7 @@ pub async fn run_live(
     let port = server_cfg.port;
     let (ctx, mut broker) = LiveContext::setup(tickers, config, broker, server_cfg).await?;
     let ibkr_client = &ctx.ibkr_client;
-    let orders = OrderClient::new(ibkr_client);
+    let orders = OrderClient::new(ibkr_client, ctx.order_id_gen.clone());
 
     let mut states = init_ticker_states(
         tickers, config, ibkr_client, &ctx.health_state,

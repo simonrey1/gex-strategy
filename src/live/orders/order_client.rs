@@ -1,5 +1,7 @@
 use anyhow::Result;
+use std::sync::Arc;
 
+use crate::broker::ibkr::OrderIdGen;
 use crate::broker::types::BracketOrderIds;
 use crate::config::Ticker;
 use crate::strategy::shared::PortfolioSlotSizing;
@@ -9,13 +11,16 @@ use super::bracket_legs::BracketLegs;
 use super::order_fill::SharedFillState;
 
 /// Thin wrapper around `ibapi::Client` that groups all order-placement methods.
+/// Uses our own `OrderIdGen` to avoid ibapi's internal counter, which can be
+/// stale after IB Gateway restarts (paper trading returns nextValidId=1).
 pub struct OrderClient<'a> {
     pub client: &'a ibapi::Client,
+    id_gen: Arc<OrderIdGen>,
 }
 
 impl<'a> OrderClient<'a> {
-    pub fn new(client: &'a ibapi::Client) -> Self {
-        Self { client }
+    pub fn new(client: &'a ibapi::Client, id_gen: Arc<OrderIdGen>) -> Self {
+        Self { client, id_gen }
     }
 
     pub async fn cancel_bracket_quietly(&self, bracket: &Option<BracketOrderIds>) {
@@ -40,18 +45,20 @@ impl<'a> OrderClient<'a> {
     async fn place_market_order(&self, ticker: Ticker, shares: u32, is_buy: bool) -> Result<()> {
         use ibapi::prelude::*;
         let contract = Contract::stock(ticker.as_str()).build();
-        let builder = self.client.order(&contract);
         let qty = shares.to_f64();
+        let builder = self.client.order(&contract);
         let order = if is_buy {
-            builder.buy(qty)
+            builder.buy(qty).market().build_order()
         } else {
-            builder.sell(qty)
-        };
-        order.market().submit().await
-            .map_err(|e| anyhow::anyhow!("market {} failed: {:?}", if is_buy { "buy" } else { "sell" }, e))?;
+            builder.sell(qty).market().build_order()
+        }.map_err(|e| anyhow::anyhow!("build market order failed: {:?}", e))?;
+
+        let oid = self.id_gen.next();
+        self.client.submit_order(oid, &contract, &order).await
+            .map_err(|e| anyhow::anyhow!("market {} failed (oid={}): {:?}", if is_buy { "buy" } else { "sell" }, oid, e))?;
         let label = if is_buy { "BUY" } else { "SELL" };
         let reason = if is_buy { "cover short" } else { "emergency/exit" };
-        println!("[ibkr] MARKET {} {} x{} ({})", label, ticker, shares, reason);
+        println!("[ibkr] MARKET {} {} x{} oid={} ({})", label, ticker, shares, oid, reason);
         Ok(())
     }
 
@@ -65,28 +72,32 @@ impl<'a> OrderClient<'a> {
         let rounded_tp = crate::types::round_cents(legs.tp_price);
         let qty = legs.shares.to_f64();
 
-        let tp_id = self.client
-            .order(&contract)
+        let tp_order = self.client.order(&contract)
             .sell(qty)
             .good_till_cancel()
             .limit(rounded_tp)
-            .submit()
-            .await
-            .map_err(|e| anyhow::anyhow!("GTC TP order failed: {:?}", e))?;
+            .build_order()
+            .map_err(|e| anyhow::anyhow!("build GTC TP order failed: {:?}", e))?;
 
-        let sl_id = self.client
-            .order(&contract)
+        let tp_oid = self.id_gen.next();
+        self.client.submit_order(tp_oid, &contract, &tp_order).await
+            .map_err(|e| anyhow::anyhow!("GTC TP order submit failed (oid={}): {:?}", tp_oid, e))?;
+
+        let sl_order = self.client.order(&contract)
             .sell(qty)
             .good_till_cancel()
             .stop(rounded_sl)
-            .submit()
-            .await
-            .map_err(|e| anyhow::anyhow!("GTC SL order failed: {:?}", e))?;
+            .build_order()
+            .map_err(|e| anyhow::anyhow!("build GTC SL order failed: {:?}", e))?;
+
+        let sl_oid = self.id_gen.next();
+        self.client.submit_order(sl_oid, &contract, &sl_order).await
+            .map_err(|e| anyhow::anyhow!("GTC SL order submit failed (oid={}): {:?}", sl_oid, e))?;
 
         Ok(BracketOrderIds {
             parent_id: 0,
-            stop_loss_id: sl_id.into(),
-            take_profit_id: tp_id.into(),
+            stop_loss_id: sl_oid,
+            take_profit_id: tp_oid,
         })
     }
 
@@ -128,25 +139,34 @@ impl<'a> OrderClient<'a> {
 
         let rounded_sl = crate::types::round_cents(new_sl_price);
         let qty = shares.to_f64();
-        match self.client.order(&contract).sell(qty).good_till_cancel().stop(rounded_sl).submit().await {
-            Ok(id) => Ok((id.into(), rounded_sl)),
+
+        let order = self.client.order(&contract)
+            .sell(qty)
+            .good_till_cancel()
+            .stop(rounded_sl)
+            .build_order()
+            .map_err(|e| anyhow::anyhow!("build stop order failed: {:?}", e))?;
+
+        let oid = self.id_gen.next();
+        match self.client.submit_order(oid, &contract, &order).await {
+            Ok(()) => Ok((oid, rounded_sl)),
             Err(e) => {
                 eprintln!(
-                    "[live-{}] New SL @ ${:.2} failed, restoring @ ${:.2}: {:?}",
-                    ticker, new_sl_price, old_sl_price, e
+                    "[live-{}] New SL @ ${:.2} failed (oid={}), restoring @ ${:.2}: {:?}",
+                    ticker, new_sl_price, oid, old_sl_price, e
                 );
-                let fallback: i32 = self.client
-                    .order(&contract)
+                let fallback_order = self.client.order(&contract)
                     .sell(qty)
                     .good_till_cancel()
                     .stop(old_sl_price)
-                    .submit()
-                    .await
-                    .map(|id| id.into())
+                    .build_order()
+                    .map_err(|e2| anyhow::anyhow!("build fallback stop failed: {:?}", e2))?;
+                let fallback_oid = self.id_gen.next();
+                self.client.submit_order(fallback_oid, &contract, &fallback_order).await
                     .map_err(|e2| anyhow::anyhow!(
                         "CRITICAL: both new and fallback SL failed: {:?} / {:?}", e, e2
                     ))?;
-                Ok((fallback, old_sl_price))
+                Ok((fallback_oid, old_sl_price))
             }
         }
     }

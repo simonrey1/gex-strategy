@@ -3,6 +3,7 @@ use chrono::Datelike;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::config;
 use crate::config::Ticker;
@@ -11,10 +12,39 @@ use crate::types::OhlcBar;
 
 use super::types::{AccountSummary, BracketOrder, BracketOrderIds, Broker, MarketOrder};
 
-#[derive(Default)]
+/// Epoch-based order ID floor. Paper trading's nextValidId is unreliable
+/// after gateway restarts (returns 1 but rejects it as duplicate).
+fn epoch_order_id() -> i32 {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // Use last 9 digits of epoch to stay well within i32::MAX (2.1B)
+    (secs % 1_000_000_000) as i32
+}
+
+/// Thread-safe order ID generator that bypasses ibapi's internal counter.
+pub struct OrderIdGen(AtomicI32);
+
+impl OrderIdGen {
+    pub fn new(start: i32) -> Self {
+        Self(AtomicI32::new(start))
+    }
+    pub fn next(&self) -> i32 {
+        self.0.fetch_add(1, Ordering::SeqCst)
+    }
+}
+
 pub struct IbkrBroker {
     client: Option<Arc<ibapi::Client>>,
     connected: bool,
+    order_id_gen: Option<Arc<OrderIdGen>>,
+}
+
+impl Default for IbkrBroker {
+    fn default() -> Self {
+        Self { client: None, connected: false, order_id_gen: None }
+    }
 }
 
 impl IbkrBroker {
@@ -31,6 +61,10 @@ impl IbkrBroker {
 
     pub fn client_arc(&self) -> Option<Arc<ibapi::Client>> {
         self.client.clone()
+    }
+
+    pub fn order_id_gen(&self) -> Option<Arc<OrderIdGen>> {
+        self.order_id_gen.clone()
     }
 }
 
@@ -73,24 +107,16 @@ impl Broker for IbkrBroker {
 
                 match ibapi::Client::connect(&addr, client_id).await {
                     Ok(client) => {
-                        let local_id = client.next_order_id();
-                        match client.next_valid_order_id().await {
-                            Ok(server_id) => {
-                                println!(
-                                    "[ibkr] Connected (local_next_oid={}, server_next_oid={})",
-                                    local_id, server_id
-                                );
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "[ibkr] Connected but next_valid_order_id() failed: {:?} (local_next_oid={})",
-                                    e, local_id
-                                );
-                            }
-                        }
+                        let server_id = client.next_valid_order_id().await.unwrap_or(0);
+                        let epoch_floor = epoch_order_id();
+                        let start_id = server_id.max(epoch_floor);
+                        println!(
+                            "[ibkr] Connected (server_next_oid={}, epoch_floor={}, using={})",
+                            server_id, epoch_floor, start_id
+                        );
+                        self.order_id_gen = Some(Arc::new(OrderIdGen::new(start_id)));
                         self.client = Some(Arc::new(client));
                         self.connected = true;
-                        println!("[ibkr] Connected to IBKR Gateway");
                         return Ok(());
                     }
                     Err(e) => {

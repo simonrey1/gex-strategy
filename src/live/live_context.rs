@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::broker::ibkr::IbkrBroker;
+use crate::broker::ibkr::{IbkrBroker, OrderIdGen};
 use crate::broker::types::Broker as _;
 use crate::config::{StrategyConfig, Ticker};
 
@@ -20,6 +20,7 @@ use crate::data::thetadata_live::{new_live_gex, start_live_gex, SharedLiveGex};
 /// All shared state produced by [`LiveContext::setup`].
 pub struct LiveContext {
     pub ibkr_client: Arc<ibapi::Client>,
+    pub order_id_gen: Arc<OrderIdGen>,
     pub health_state: SharedHealthState,
     pub live_gex: SharedLiveGex,
     pub fill_state: SharedFillState,
@@ -46,6 +47,9 @@ impl LiveContext {
         let ibkr_client = broker
             .client_arc()
             .expect("broker connected but no client");
+        let order_id_gen = broker
+            .order_id_gen()
+            .expect("broker connected but no order ID generator");
 
         let health_state = new_health_state();
         {
@@ -102,7 +106,7 @@ impl LiveContext {
         }
 
         Ok((
-            Self { ibkr_client, health_state, live_gex, fill_state, shutdown, initial_equity, spot_prices },
+            Self { ibkr_client, order_id_gen, health_state, live_gex, fill_state, shutdown, initial_equity, spot_prices },
             broker,
         ))
     }
