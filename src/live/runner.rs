@@ -59,6 +59,17 @@ pub async fn run_live(
         eprintln!("[live] SIGINT handler registration failed: {} — Ctrl+C may not work", e);
     }
 
+    // One-time cleanup: cancel all stale orders from previous gateway sessions.
+    // After a gateway restart, old orders are still active server-side but
+    // unmanageable via individual cancel_order (wrong client/session).
+    // global_cancel clears them so we can re-place fresh brackets.
+    if let Err(e) = ibkr_client.global_cancel().await {
+        eprintln!("[live] global_cancel failed: {:?} (non-fatal)", e);
+    } else {
+        println!("[live] global_cancel issued — clearing stale orders from previous sessions");
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    }
+
     let mut current_day = NyseSession::et_date_str(&chrono::Utc::now());
     let freshness_timeout_ms = poll_ms * 3;
     let mut ibkr_down_since: Option<tokio::time::Instant> = None;

@@ -73,6 +73,21 @@ impl Broker for IbkrBroker {
 
                 match ibapi::Client::connect(&addr, client_id).await {
                     Ok(client) => {
+                        let local_id = client.next_order_id();
+                        match client.next_valid_order_id().await {
+                            Ok(server_id) => {
+                                println!(
+                                    "[ibkr] Connected (local_next_oid={}, server_next_oid={})",
+                                    local_id, server_id
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[ibkr] Connected but next_valid_order_id() failed: {:?} (local_next_oid={})",
+                                    e, local_id
+                                );
+                            }
+                        }
                         self.client = Some(Arc::new(client));
                         self.connected = true;
                         println!("[ibkr] Connected to IBKR Gateway");
